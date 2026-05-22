@@ -3,6 +3,10 @@
 YouTrack is JetBrains' official issue tracker — the right venue for this.
 Three options, from easiest to most invasive.
 
+**As of 2026-05, two open tickets already describe this deadlock** — see §2
+for the IDs and drafted comments. Prefer commenting on an existing ticket
+over filing a new one; duplicates get closed and lose the diagnostic detail.
+
 The root cause is two-pronged and both prongs should be mentioned in any
 ticket:
 
@@ -76,14 +80,153 @@ The key data points they need:
 
 ## 2. Comment on an existing ticket
 
-Before filing new, search YouTrack for `"VCS root" submodule deadlock`
-and `"checkAndUpdateRepositoryCollection"`. Known candidate:
+Two confirmed open tickets match (verified 2026-05 via the YouTrack
+public API):
 
-- **IDEA-188998** — *"VCS root discovery is slow with many
-  submodules"*. Same neighbourhood; could be the same bug viewed
-  from a different angle. Adding our diagnostic to an existing
-  ticket is usually higher-signal than a duplicate file. Reference
-  our doc and the live thread dump.
+- **[IJPL-244177](https://youtrack.jetbrains.com/issue/IJPL-244177)** —
+  *"Git4Idea deadlock with 80+ repos"*. State: Submitted, unassigned.
+  Reported against PyCharm 2026.1.1; reporter calls it a regression
+  from 2025.3. Description names every component this agent targets:
+  `VcsRepositoryManager` write lock held by `GitRepositoryImpl.<init>`
+  at `GitRepositoryImpl.kt:81` blocked inside `runBlockingMaybeCancellable
+  → runBlockingCancellable → runBlocking`, with dozens of dispatcher
+  workers queued on `checkAndUpdateRepositoryCollection` at
+  `VcsRepositoryManager.kt:354`. Reporter's workaround is
+  `-Dkotlinx.coroutines.io.parallelism=256` (mask, not fix).
+- **[IJPL-244426](https://youtrack.jetbrains.com/issue/IJPL-244426)** —
+  *"Editor freezes on every keystroke at AsyncCompletion.startThread in
+  2026.1.1 (thread starvation by VcsRepositoryManager.checkAndUpdateRepositoryCollection)"*.
+  State: Submitted, unassigned. Different surface symptom (per-keystroke
+  EDT freeze on an `AsyncCompletion` semaphore + concurrent
+  `RegionUrlMapper` HTTP timeouts) but the title attributes it to the
+  same `Dispatchers.IO` starvation. Plausibly a downstream manifestation
+  of IJPL-244177 once the pool is wedged.
+
+The drafted comments below are kept here so they version-control with
+the repo; copy/paste into YouTrack's comment box (it accepts markdown).
+
+### Draft comment for IJPL-244177
+
+```markdown
+Confirming the same diagnosis from a separate reproducer (PyCharm Community
+2025.x on Linux, project with ~167 nested `.git` directories). Thread dump
+shows exactly the chain described in the OP:
+
+- One `DefaultDispatcher-worker-N` parked in `LockSupport.parkNanos` inside
+  `joinBlocking` → `runBlockingMaybeCancellable` → `GitRepositoryImpl.<init>`
+  at `GitRepositoryImpl.kt:81` (the `workingTreeHolder.updateState()` call),
+  holding `VcsRepositoryManager.MODIFY_LOCK`.
+- 70+ other dispatcher workers `WAITING` on that same lock inside
+  `VcsRepositoryManager.checkAndUpdateRepositoryCollection`
+  (`VcsRepositoryManager.kt:354`).
+- The coroutine the lock-holder is blocking on cannot be scheduled because
+  the entire pool is queued on the lock it holds — classic resource deadlock.
+  `Thread pool exhaustion: Dispatchers.IO is not responding for 5000 ms`
+  every ~5 s for the rest of the session.
+
+The `-Dkotlinx.coroutines.io.parallelism=256` workaround masks the deadlock
+by giving the pool enough headroom that the unblocking coroutine can sneak
+onto a free worker before all workers are queued. It is fragile: any project
+large enough to queue 256+ workers on the lock brings the deadlock back. The
+fix should remove the cycle, not enlarge the pool.
+
+### Root cause is in the constructor, not the manager
+
+`GitRepositoryImpl.<init>` synchronously bridges into a suspend function
+while the caller (`checkAndUpdateRepositoryCollection`) holds a global write
+lock. Construction is N × that bridge cost while the lock is held, and the
+suspend function itself wants a worker — the deadlock is structural.
+
+### Minimal fix (one line)
+
+`plugins/git4idea/src/git4idea/repo/GitRepositoryImpl.kt` around line 81 —
+drop the `runBlockingMaybeCancellable { workingTreeHolder.updateState() }`
+call from the constructor. The first real `updateState()` then happens
+lazily via `GitRepository.update()` / the existing alarm path / any later
+refresh trigger — all of which already run *outside* `MODIFY_LOCK` on their
+own dispatcher. State consumers (gutter, annotations, log) subscribe to the
+state-flow and update reactively, so the transient empty state at
+end-of-ctor is handled the same way it's handled after any refresh.
+
+### Defence in depth
+
+Independently, `VcsRepositoryManager.checkAndUpdateRepositoryCollection`
+should construct the new `GitRepositoryImpl` instances **outside**
+`MODIFY_LOCK` and only take the lock for the atomic map swap. That removes
+the O(N) blocking work from inside the lock regardless of what individual
+constructors do.
+
+### Proof-of-concept workaround
+
+I have a userland `-javaagent` that performs exactly the constructor change
+above by ASM-rewriting the offending `INVOKESTATIC` at JVM class-load time
+(replaces it with `POP; ACONST_NULL;`). Same 167-repo reproducer: indexing
+completes in ~5 s, dumb mode exits in ~3 s, zero perfwatcher freezes, no
+lock waiters, all VCS features (gutter, annotations, log, branch ops,
+push/pull) continue to work normally.
+
+Source, build script, install script:
+<https://github.com/bitranox/pycharm-vcs-deadlock-fix>
+
+Possibly the same root cause as IJPL-244426 (different surface symptom,
+same attribution in the title).
+```
+
+### Draft comment for IJPL-244426
+
+```markdown
+The title attributes this to "thread starvation by
+`VcsRepositoryManager.checkAndUpdateRepositoryCollection`", which is
+consistent with the unresolved IJPL-244177 ("Git4Idea deadlock with 80+
+repos"). If that is in fact the root cause here, the
+EDT-on-`AsyncCompletion`-semaphore freeze is a downstream symptom:
+`Dispatchers.IO` is wedged because one worker holds
+`VcsRepositoryManager.MODIFY_LOCK` while parked inside
+`GitRepositoryImpl.<init>` → `runBlockingMaybeCancellable` (at
+`GitRepositoryImpl.kt:81`), and every other worker is queued on the same
+lock. With the pool exhausted, anything that schedules onto it starves —
+including completion contributors and `RegionUrlMapper`'s `HttpClient`
+call. That would explain the otherwise-puzzling combination of an
+idle-looking pool plus the "Thread pool exhaustion: Dispatchers.IO is not
+responding for 5000 ms" log spam plus the `HttpConnectTimeoutException`
+against a host the JBR can otherwise reach in <1 s.
+
+### Quick way to confirm or rule out
+
+At the moment of freeze, capture a thread dump
+(`jcmd <pid> Thread.print -l`) and check:
+
+\`\`\`bash
+grep -c checkAndUpdateRepositoryCollection dump.txt   # waiters on MODIFY_LOCK
+grep -c 'GitRepositoryImpl.<init>'         dump.txt   # ctors in flight
+\`\`\`
+
+If `waiters >= ~10` and one thread is parked in `joinBlocking` inside
+`GitRepositoryImpl.<init>:81`, this is IJPL-244177 manifesting as a UI
+freeze rather than as a startup hang. If neither pattern is present, the
+`AsyncCompletion` semaphore lost-wakeup is an independent bug and this
+ticket should stay separate.
+
+### If it is the same root cause
+
+The fix is to remove the
+`runBlockingMaybeCancellable { workingTreeHolder.updateState() }` call
+from `GitRepositoryImpl.<init>` — first state population then happens
+lazily via `GitRepository.update()` / the existing alarm path, which run
+outside `MODIFY_LOCK` on their own dispatcher.
+
+### Workaround for reproduction / triage
+
+A userland `-javaagent` that performs that single bytecode change at
+class-load time (ASM rewrite of one `INVOKESTATIC` to `POP; ACONST_NULL;`):
+<https://github.com/bitranox/pycharm-vcs-deadlock-fix>
+
+If installing it makes this ticket's freezes disappear, that's strong
+evidence the root cause is shared with IJPL-244177. If freezes persist
+after install (and the agent logs `neutralizing ... call site #1` in
+`idea.log`), the `AsyncCompletion` semaphore issue is independent and
+the ticket should stay open as its own thing.
+```
 
 ## 3. Code PR to intellij-community
 
