@@ -229,5 +229,9 @@ Live measurements on `rotek-apps` (167 nested git repos):
   measurements, and the upstream-fix recommendation.
 - [`jetbrains_submit.md`](jetbrains_submit.md) — how to submit this
   issue / fix to JetBrains via YouTrack.
+- [`ai-transparency.md`](ai-transparency.md) — honest disclosure of
+  how this repository was developed (AI-assisted) and how you can
+  audit / rebuild from source if you don't want to trust the
+  pre-built JAR.
 - [`CLAUDE.md`](CLAUDE.md) — context for AI assistants (Claude Code
   and similar) entering this repo.
