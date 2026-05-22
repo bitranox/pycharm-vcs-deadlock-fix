@@ -168,6 +168,10 @@ push/pull) continue to work normally.
 Source, build script, install script:
 <https://github.com/bitranox/pycharm-vcs-deadlock-fix>
 
+Proposed upstream fix (same change expressed in Kotlin source, with a
+short comment explaining the lock interaction):
+<https://github.com/JetBrains/intellij-community/pull/3518>
+
 Possibly the same root cause as IJPL-244426 (different surface symptom,
 same attribution in the title).
 ```
@@ -226,6 +230,9 @@ evidence the root cause is shared with IJPL-244177. If freezes persist
 after install (and the agent logs `neutralizing ... call site #1` in
 `idea.log`), the `AsyncCompletion` semaphore issue is independent and
 the ticket should stay open as its own thing.
+
+For reference, the source-level fix proposed for IJPL-244177:
+<https://github.com/JetBrains/intellij-community/pull/3518>
 ```
 
 ## 3. Code PR to intellij-community
