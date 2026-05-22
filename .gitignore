@@ -1,0 +1,15 @@
+# Build outputs
+/build/
+*.class
+
+# Local OS / editor cruft
+.DS_Store
+*~
+*.swp
+*.swo
+.idea/
+*.iml
+.vscode/
+
+# Don't ignore the published agent JAR
+!dist/pycharm-vcs-patch.jar
