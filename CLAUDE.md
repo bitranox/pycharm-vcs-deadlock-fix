@@ -1,8 +1,9 @@
-# CLAUDE.md — pycharm_vcs_patch
+# CLAUDE.md — pycharm-vcs-deadlock-fix
 
-Context for AI assistants (Claude Code) entering this directory.
+Context for AI assistants (Claude Code and similar) entering this
+repository.
 
-## What this directory is
+## What this repository is
 
 A self-contained Java agent that patches one specific `INVOKESTATIC`
 inside `git4idea.repo.GitRepositoryImpl.<init>` — the call to
@@ -11,106 +12,69 @@ that wraps `workingTreeHolder.updateState()` — by replacing it with
 `POP; ACONST_NULL;`. This defuses the deadlock that occurs when
 `VcsRepositoryManager.checkAndUpdateRepositoryCollection` calls the
 constructor N times under the global `MODIFY_LOCK` for a project with
-N nested git repos.
+N nested git repositories.
 
 It is **not** a JetBrains-supported plugin; it is a userland
 workaround that operates by bytecode rewriting at JVM class-load
 time. The patch is permanent for the JVM session — there is no
-restore logic because the patched constructor is correct on its own
-(the `updateState()` it skipped runs lazily later via the same
-suspend function from `GitRepository.update()`, the existing alarm
-path, or any other refresh trigger — all outside the global VCS
-lock).
+restore logic, because the patched constructor is correct on its own.
+The `updateState()` it skipped runs lazily later via the same suspend
+function from `GitRepository.update()`, the existing alarm path, or
+any other refresh trigger — all outside the global VCS lock.
 
-Earlier iterations of this agent (preserved in git history of this
-directory) targeted `VcsRepositoryManager.findNewRoots` and used
-batched rate-limiting + DumbService-triggered restore. Those
-approaches work but trade one long IDE freeze for many shorter ones
-because the lock-hold time during each batch is still significant.
-The constructor patch removes the cost entirely.
+Earlier iterations of this agent (preserved in git history) targeted
+`VcsRepositoryManager.findNewRoots` and used batched rate-limiting +
+DumbService-triggered restore. Those approaches work but trade one
+long IDE freeze for many shorter ones, because the lock-hold time
+during each batch is still significant. The constructor patch removes
+the cost entirely.
 
-See `README.md` for the user-facing guide.
+See [`README.md`](README.md) for the user-facing guide.
 
 ## Architectural orientation
 
 ```
-src/VcsPatchAgent.java            single-file Java source for the agent
-dist/pycharm-vcs-patch.jar        compiled, packaged JAR (premain agent)
-build.sh                          rebuild dist/*.jar from src/*
-install.sh                        copy JAR to ~/.config/.../agents/ and
-                                  wire it into pycharm64.vmoptions
-README.md                         user docs
-CLAUDE.md                         this file
+src/VcsPatchAgent.java       single-file Java source for the agent
+dist/pycharm-vcs-patch.jar   compiled, packaged JAR (premain agent)
+build.sh                     rebuild dist/*.jar from src/*
+install.sh                   copy JAR to PyCharm's config dir and
+                             wire it into pycharm64.vmoptions
+README.md                    user docs
+docs/DIAGNOSTIC.md           full diagnostic write-up (case study)
+jetbrains_submit.md          how to submit this issue / fix upstream
+CLAUDE.md                    this file
+LICENSE                      Apache-2.0 (this project)
+NOTICE                       bundled ASM (BSD-3-Clause) attribution
 ```
 
 The agent uses ASM 9 for bytecode rewriting. ASM is bundled into the
-agent JAR itself (no runtime classpath dependency on PyCharm's own
-ASM). The JAR is built with the JBR's bundled `javac`:
+agent JAR itself, so the agent has no runtime classpath dependency on
+PyCharm's own ASM. `build.sh` builds the JAR using PyCharm's bundled
+JBR `javac` and an ASM JAR found anywhere under `~/.local/share/JetBrains`.
+
+## Expected log markers each PyCharm session
+
+In PyCharm stdout, or in
+`~/.cache/JetBrains/PyCharmXXXX.X/log/idea.log` (search for
+`VcsPatchAgent`):
 
 ```
-~/.local/share/JetBrains/Toolbox/apps/pycharm-community/jbr/bin/javac
+[VcsPatchAgent] premain: target=git4idea/repo/GitRepositoryImpl.<init>
+                neutralizing com/intellij/openapi/progress/CoroutinesKt.runBlockingMaybeCancellable
+[VcsPatchAgent] neutralizing com/intellij/openapi/progress/CoroutinesKt.runBlockingMaybeCancellable(...)
+                in git4idea/repo/GitRepositoryImpl.<init> (call site #1)
 ```
 
-ASM source is unpacked from PyCharm's Junie plugin location:
+The first marker is logged unconditionally at premain. The second is
+logged only when the JVM first goes to load
+`git4idea.repo.GitRepositoryImpl` — typically within seconds of
+project open.
 
-```
-~/.local/share/JetBrains/PyCharm2026.1/ej/lib/asm-9.6.jar
-```
-
-## Related files outside this directory
-
-- **Full diagnostic write-up** — symptom, live `jcmd` evidence,
-  code-level root cause traced into IntelliJ Community source with
-  line numbers, before/after metrics, and what the upstream JetBrains
-  fix would look like:
-  - `../Docs/pycharm_vcs_deadlock.md`
-
-- **Mount-layer document** — bindfs vs kernel-bind + idmap discussion
-  for the LXC container. Unrelated to the VCS deadlock at the code
-  level, but they sometimes interact (FUSE mount → no inotify → every
-  startup does a heavy scan → exacerbates whatever the VCS subsystem
-  is doing):
-  - `../Docs/mount_options.md`
-
-- **PyCharm vmoptions** — the live IDE config; the agent is wired in
-  here. If you remove the `-javaagent:` line, the patch is fully
-  disabled.
-  - `~/.config/JetBrains/PyCharm2026.1/pycharm64.vmoptions`
-
-- **PyCharm logs** — search for `[VcsPatchAgent]` to see what the
-  agent did at startup. Markers logged are: `premain:`, `patching`,
-  `captured Class object:`, `restore:`.
-  - `~/.cache/JetBrains/PyCharm2026.1/log/idea.log`
-
-## Persistent memory references
-
-Claude's auto-memory for the user (`srvadmin`) lives at
-`~/.claude/projects/-home-srvadmin/memory/MEMORY.md` and indexes
-individual memory files. Relevant entries that may exist:
-
-- A reference memory pointing to *this* directory should be present
-  there under a slug like `pycharm-vcs-patch-location`. If it is, it
-  is the canonical place to look up where this work-around lives.
-- If the memory references this directory but the entry is missing
-  there, add it back with frontmatter type=`reference`.
-
-When the user asks about PyCharm "Analyzing project to enable smart
-features" hangs, or PyCharm freezing during indexing on big multi-repo
-projects, prefer:
-
-1. Pointing at this directory (and `../Docs/pycharm_vcs_deadlock.md`
-   for the full analysis) **before** suggesting any new fix.
-2. Checking whether the `-javaagent:` line in `pycharm64.vmoptions`
-   is still present and the JAR exists on disk.
-3. Grepping `idea.log` for `[VcsPatchAgent]` to confirm the agent
-   loaded. Expected markers each session:
-     - `premain: target=git4idea/repo/GitRepositoryImpl.<init> neutralizing …`
-     - `neutralizing com/intellij/openapi/progress/CoroutinesKt.runBlockingMaybeCancellable(…) in git4idea/repo/GitRepositoryImpl.<init> (call site #1)`
-
-If the agent's WARNING fires (`no runBlockingMaybeCancellable call
-found in target class`), JetBrains has changed the constructor; the
-agent needs updating. See `src/VcsPatchAgent.java` constants
-`NEUTRALIZE_OWNER` / `NEUTRALIZE_NAME` / `TARGET_INTERNAL`.
+If the agent logs a WARNING saying *"no runBlockingMaybeCancellable
+call found in target class"*, JetBrains has changed the constructor;
+the agent becomes a safe no-op and PyCharm runs stock. The agent's
+target identifiers are constants in `src/VcsPatchAgent.java`:
+`TARGET_INTERNAL`, `NEUTRALIZE_OWNER`, `NEUTRALIZE_NAME`.
 
 ## Useful diagnostic recipes
 
@@ -127,8 +91,8 @@ JBR=~/.local/share/JetBrains/Toolbox/apps/pycharm-community/jbr/bin
 "$JBR/jcmd" "$PID" Thread.print -l > /tmp/dump.txt
 ```
 
-CPU sampling that actually works inside this LXC (don't use
-`/proc/PID/schedstat` — it returns near-zero regardless of activity):
+CPU sampling that works inside LXC containers where `schedstat` is
+unreliable:
 
 ```bash
 HZ=$(getconf CLK_TCK)
@@ -141,44 +105,65 @@ Detect the deadlock pattern in a dump:
 
 ```bash
 DUMP=/tmp/dump.txt
-echo "VCS waiters:    $(grep -c checkAndUpdateRepositoryCollection "$DUMP")"
-echo "ctors in flight:$(grep -c 'GitRepositoryImpl.<init>' "$DUMP")"
-echo "cancelling:     $(grep -c '{Cancelling}' "$DUMP")"
+echo "VCS waiters:     $(grep -c checkAndUpdateRepositoryCollection "$DUMP")"
+echo "ctors in flight: $(grep -c 'GitRepositoryImpl.<init>' "$DUMP")"
+echo "cancelling:      $(grep -c '{Cancelling}' "$DUMP")"
 ```
 
 If `VCS waiters >= ~10` and CPU is near-idle, you are looking at the
 same pathology this patch addresses. Either the patch isn't loaded
-(check `idea.log`), it was restored prematurely (rare), or there's a
+(check `idea.log` for `VcsPatchAgent` lines), or the target
+constructor changed (`patch had no effect` WARNING), or there's a
 distinct bug.
 
-## Don't accidentally break this
+## Surrounding context the patch is NOT for
 
-- Do **not** add `Git4Idea` or `Subversion` to `disabled_plugins.txt`.
-  Earlier diagnostic sessions tried that as a workaround; it works but
-  removes the entire Git UI. The agent makes that unnecessary.
-- Do **not** put `<mapping … vcs="">` on parents in `.idea/vcs.xml`
-  expecting them to suppress auto-detection — they don't. Longest-path
-  match means more-specific Git mappings still get added.
-- Do **not** put `vcs.root.detector.enabled=false` in
-  `early-access-registry.txt` — that key name is not read by 2026.1.
-- The right way to stop a particular repo being tracked is to
-  remove its `<mapping>` line from `vcs.xml` (PyCharm closed), or use
-  *Settings → Version Control → Directory Mappings* in the UI.
+If you see PyCharm freezes in the same `VcsRepositoryManager` area
+with characteristics *different* from this one, the agent is unlikely
+to help. Other things that surface as "PyCharm hangs on indexing":
+
+- Slow filesystem (CIFS / NFS / FUSE bindfs without `actimeo` tuning).
+  Symptom: high disk I/O during indexing, indexing eventually
+  completes (just slowly). This patch does nothing about that — fix
+  the storage. The diagnostic doc has a paragraph on this.
+- `data.services.jetbrains.com` slow / unreachable. Symptom:
+  `RegionUrlMapper - Failed to fetch regional URL mappings`. Fix
+  with `-Dide.http.client.read.timeout=60000`,
+  `-Djava.net.preferIPv4Stack=true` in `pycharm64.vmoptions`.
+- AI Assistant / Junie plugin hung on a remote analytics call.
+  Symptom: `JcpAnalyticsClient` in shutdown thread dump. Fix by
+  disabling those plugins in `disabled_plugins.txt`.
+
+This agent is specifically for the case where **many GitRepositoryImpl
+constructors execute serially under `MODIFY_LOCK`**, which the live
+thread dump will show clearly.
 
 ## Don't accidentally break the agent
 
 - The transformer targets the **first** INVOKESTATIC of
   `runBlockingMaybeCancellable` inside `<init>`. If JetBrains adds
   another such call to the constructor before the existing one, we
-  would neutralize it instead — likely incorrect. Read the byte-code
-  via `javap -c -p` after a Toolbox update; the patched method should
-  contain no `runBlockingMaybeCancellable` references in `<init>`
-  (other methods of GitRepositoryImpl are fine).
+  would neutralize that one — likely incorrect. After a JetBrains
+  update, verify with `javap -c -p` on the patched class: `<init>`
+  should contain zero `runBlockingMaybeCancellable` references (other
+  methods of `GitRepositoryImpl` are fine).
 - The other call site (in `update()` / `GitRepositoryImpl$update$1`)
   is intentionally **not** patched. That path is called from outside
   any global lock and the synchronous behaviour is desired —
   user-initiated refresh should block until state is fresh.
 - The agent intercepts only by exact `(opcode, owner, name)` match. A
-  rename of the helper or a move to a different class would cause the
+  rename of the helper or a move to a different class causes the
   agent to find zero call sites and log a WARNING. The agent then
   becomes a no-op and PyCharm runs stock — failure mode is safe.
+
+## Code-style hints if extending
+
+- Single source file under `src/`, package `dev.bx.pycharm`.
+- ASM only at agent-load time, not at agent-runtime once the
+  transformer has fired. Avoid pulling in additional dependencies; the
+  agent should remain small and self-contained for trust reasons.
+- Don't add restore-via-`redefineClasses` logic unless absolutely
+  necessary. The JVM disallows adding or removing methods via
+  redefineClasses, which trapped earlier iterations of this agent.
+  The current "patch and stay patched" design avoids that pitfall
+  entirely.

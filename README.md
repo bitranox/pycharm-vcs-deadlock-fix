@@ -7,10 +7,9 @@ many nested git repositories. The agent is small (≈80 lines of source,
 one method of one class), and self-contained (ASM bundled in the JAR).
 
 Tested live against **PyCharm Community 2026.1** (build PY-261.23567.174)
-inside the PyCharm/desktop LXC (CT 1017) on `proxmox01`, opening the
-`rotek-apps` umbrella project with 167 nested git repositories.
+opening an umbrella project with 167 nested git repositories.
 
-Full diagnostic write-up: [`../Docs/pycharm_vcs_deadlock.md`](../Docs/pycharm_vcs_deadlock.md).
+Full diagnostic write-up: [`docs/DIAGNOSTIC.md`](docs/DIAGNOSTIC.md).
 How to submit upstream: [`jetbrains_submit.md`](jetbrains_submit.md).
 
 ---
@@ -37,7 +36,7 @@ A `-javaagent` JAR that, before any IntelliJ code runs:
 ## Why this is the right surgical target
 
 Stack trace of the deadlock (captured live with `jcmd Thread.print` —
-see `../Docs/pycharm_vcs_deadlock.md` §3):
+see [`docs/DIAGNOSTIC.md`](docs/DIAGNOSTIC.md) §3):
 
 ```
 VcsRepositoryManager.ensureUpToDate$lambda$0          (VcsRepositoryManager.kt:165)
@@ -224,10 +223,11 @@ Live measurements on `rotek-apps` (167 nested git repos):
 
 ## See also
 
-- [`../Docs/pycharm_vcs_deadlock.md`](../Docs/pycharm_vcs_deadlock.md)
-  — full diagnostic write-up including `jcmd` evidence and the
-  upstream-fix recommendation.
+- [`docs/DIAGNOSTIC.md`](docs/DIAGNOSTIC.md) — full diagnostic
+  write-up including `jcmd` evidence, code-level root cause traced
+  into IntelliJ Community source with line numbers, before/after
+  measurements, and the upstream-fix recommendation.
 - [`jetbrains_submit.md`](jetbrains_submit.md) — how to submit this
   issue / fix to JetBrains via YouTrack.
-- [`../Docs/mount_options.md`](../Docs/mount_options.md) — separate
-  bindfs / kernel-bind discussion for the LXC mount layer.
+- [`CLAUDE.md`](CLAUDE.md) — context for AI assistants (Claude Code
+  and similar) entering this repo.
