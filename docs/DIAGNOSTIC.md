@@ -245,12 +245,24 @@ but no fix in 2026.1.
 
 ---
 
-## 5. Applied configuration fix
+## 5. Applied fix
 
-We cannot patch IntelliJ. The N=167 multiplier in §3.5 can be defused
-by either (a) reducing N to a single-digit number, or (b) eliminating
-the entire VCS subsystem so the multiplier is structurally absent.
-**(a) was tried and failed; (b) works and is what is in place.**
+We cannot patch the IntelliJ source tree, but we can patch the running
+JVM. Three approaches were considered:
+
+- **(a)** Reduce N (the number of nested VCS mappings) to a single-digit
+  number by trimming `.idea/vcs.xml`. *Tried, did not work — see §5.1.*
+- **(b)** Eliminate the VCS subsystem entirely by disabling the Git4Idea
+  plugin. *Works, but you lose the gutter / Changes view / branch UI
+  inside PyCharm — see §5.2.*
+- **(c)** Patch the constructor at JVM class-load time, via a
+  `-javaagent` JAR that rewrites the one `INVOKESTATIC` that triggers
+  the in-lock `runBlocking`. *This is the actual fix that is now in
+  place — see §5.3.*
+
+§5.1 is preserved because the failure mode is non-obvious and worth
+documenting. §5.2 is preserved because it remains a valid fallback for
+environments where loading a `-javaagent` is undesirable.
 
 ### 5.1 Why the first attempt (trim + `vcs=""`) did NOT work
 
@@ -280,17 +292,22 @@ key names are not what the platform's `VcsRootProblemNotifier` /
 `VcsRootScanner` actually read. Unknown keys are silently ignored, so
 the entries are harmless, but they did not suppress anything.
 
-### 5.2 The working fix: disable Git4Idea (and Subversion) at the IDE level
+### 5.2 Fallback workaround: disable Git4Idea (and Subversion) at the IDE level
 
-The reliable cure is to remove the VCS subsystem from PyCharm entirely.
-With Git4Idea disabled there is no `VcsRepositoryManager`, no
-`MODIFY_LOCK`, no `findNewRoots`, no `runBlocking` in
-`GitRepositoryImpl.<init>` — the entire code path documented in §3 and
-§4 simply does not exist in the process. All `git` work must be done
-from the terminal, which is how this project was being used in practice
-anyway.
+This is the **previous** workaround used during diagnosis, retained
+here as a documented fallback. It is no longer the active fix on this
+machine — the agent in §5.3 is — but it remains useful when running a
+`-javaagent` is not an option (e.g. corporate-managed IDEs that lock
+`pycharm64.vmoptions`, or environments where the user simply does not
+need Git UI inside PyCharm).
 
-Appended to `~/.config/JetBrains/PyCharm2026.1/disabled_plugins.txt`:
+The idea is to remove the VCS subsystem from PyCharm entirely. With
+Git4Idea disabled there is no `VcsRepositoryManager`, no `MODIFY_LOCK`,
+no `findNewRoots`, no `runBlocking` in `GitRepositoryImpl.<init>` — the
+entire code path documented in §3 and §4 simply does not exist in the
+process. All `git` work must then be done from the terminal.
+
+Append to `~/.config/JetBrains/PyCharm2026.1/disabled_plugins.txt`:
 
 ```
 Git4Idea
@@ -300,20 +317,10 @@ Subversion
 `Subversion` is included for symmetry — none of these trees use SVN,
 but the same plugin would scan if SVN repos appeared.
 
-### 5.3 vcs.xml files reduced to empty comments
-
-Once the Git plugin is disabled the mappings have no effect, but the
-files are cleaned out so that if the plugin is ever re-enabled in
-future, nothing immediately repopulates them. All three umbrella
-projects:
-
-```
-/media/srv-main-softdev/rotek-apps/.idea/vcs.xml
-/media/srv-main-softdev/projects/.idea/vcs.xml
-/media/srv-main-softdev/rnprivat/.idea/vcs.xml
-```
-
-were reduced to:
+With the Git plugin disabled, `.idea/vcs.xml` mappings have no effect,
+but it is still worth blanking the file so that nothing repopulates the
+list if the plugin is ever re-enabled. All three umbrella projects'
+`vcs.xml` were reduced to:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -324,13 +331,75 @@ were reduced to:
 </project>
 ```
 
-Each previous state is preserved as `.idea/vcs.xml.before-disable-<timestamp>.bak`
-plus the original `.bak` from 2026-05-12.
+The trade-off is loss of all in-IDE Git UI: gutter blame, Changes view,
+commit dialog, log, branch widget, push, etc. For users who want any
+of that, use §5.3 instead.
 
-### 5.3 PyCharm-side vmoptions already in place
+### 5.3 The actual fix: bytecode-rewriting `-javaagent`
 
-For completeness, these were applied earlier in this session and remain
-relevant:
+The active fix is a small Java agent
+([`src/VcsPatchAgent.java`](../src/VcsPatchAgent.java), packaged as
+[`dist/pycharm-vcs-patch.jar`](../dist/pycharm-vcs-patch.jar)) loaded
+into PyCharm's JVM via `-javaagent` at launch. It uses ASM 9 to rewrite
+exactly one bytecode instruction inside one method of one class:
+
+- **Target:** `git4idea.repo.GitRepositoryImpl.<init>`, the call site
+  shown at line 81 of the constructor (the same line called out at the
+  bottom of the stack in §3.3).
+- **Operation:** locate the unique `INVOKESTATIC` of
+  `com.intellij.openapi.progress.CoroutinesKt.runBlockingMaybeCancellable`
+  inside that constructor; replace it with `POP; ACONST_NULL;`. The
+  Kotlin suspend lambda that was being run synchronously is dropped on
+  the floor, a `null` is left on the stack for the subsequent return,
+  and the constructor returns in microseconds instead of seconds.
+- **Scope:** no other call site is touched. The other
+  `runBlockingMaybeCancellable` of the same suspend function (inside
+  `GitRepository.update()` / `GitRepositoryImpl$update$1`) is left
+  intact, because that path is called from outside `MODIFY_LOCK` and
+  the synchronous behaviour there is correct.
+- **Safety:** the transformer matches by exact `(opcode, owner, name)`.
+  If JetBrains rewrites the constructor (renames the helper, moves it,
+  inlines it), the transformer finds zero call sites, logs a WARNING,
+  and becomes a no-op. PyCharm then runs stock. There is no failure
+  mode in which PyCharm runs with a half-patched constructor.
+
+The state that `updateState()` would have populated synchronously
+(current branch, HEAD, staging info) is left in its default empty
+state. The state-flow is populated lazily a few hundred milliseconds
+later, the first time any caller of `GitRepository.update()` runs —
+typically the same alarm that triggered the construction, just *after*
+`MODIFY_LOCK` has been released. UI elements that subscribe to the
+state-flow (gutter, branch widget, Changes view, log) update reactively
+when state becomes available. UI elements that read it synchronously
+during the gap see "no current branch" for a fraction of a second.
+
+Install:
+
+```
+~/.config/JetBrains/PyCharm2026.1/agents/pycharm-vcs-patch.jar
+~/.config/JetBrains/PyCharm2026.1/pycharm64.vmoptions  ← contains:
+    -javaagent:/home/srvadmin/.config/JetBrains/PyCharm2026.1/agents/pycharm-vcs-patch.jar
+```
+
+At launch you should see in stdout / `idea.log`:
+
+```
+[VcsPatchAgent] premain: target=git4idea/repo/GitRepositoryImpl.<init>
+                neutralizing com/intellij/openapi/progress/CoroutinesKt.runBlockingMaybeCancellable
+[VcsPatchAgent] neutralizing com/intellij/openapi/progress/CoroutinesKt.runBlockingMaybeCancellable(...)
+                in git4idea/repo/GitRepositoryImpl.<init> (call site #1)
+```
+
+To revert: remove the `-javaagent:` line from `pycharm64.vmoptions` and
+restart. PyCharm's own JARs are byte-for-byte unchanged on disk; the
+patch only lives in the in-memory class image for the duration of one
+JVM session. See [`README.md`](../README.md) for the full installation
+guide, build instructions, and design rationale.
+
+### 5.4 PyCharm-side vmoptions in place
+
+The following were applied earlier in the diagnostic session and remain
+useful regardless of which fix above is active:
 
 ```
 ~/.config/JetBrains/PyCharm2026.1/pycharm64.vmoptions
@@ -345,10 +414,10 @@ relevant:
 
 These address an unrelated 11-s `RegionUrlMapper` fetch
 (`data.services.jetbrains.com/products` returns 26 MB) and silence the
-freeze-dump spam, but do *not* fix the VCS deadlock — only the §5.1 + §5.2
-configuration changes do.
+freeze-dump spam, but do *not* fix the VCS deadlock — only §5.3 (or as
+a fallback, §5.2) does.
 
-### 5.4 Junie / AI Assistant disabled
+### 5.5 Junie / AI Assistant disabled
 
 `~/.config/JetBrains/PyCharm2026.1/disabled_plugins.txt` includes
 `org.jetbrains.junie`. This removes one source of the network-dependent
@@ -359,46 +428,73 @@ mentioned for completeness.
 
 ## 6. Verification
 
-Three measured states of the same `rotek-apps` project:
+Four measured states of the same `rotek-apps` project, listed
+left-to-right in the order they were tried:
 
-| Metric | Original (167 mappings, Git enabled) | Trim-only attempt (re-bloated to 170+) | After Git4Idea disabled |
-|---|---|---|---|
-| Mappings in `vcs.xml` | 167 | 170+ (auto-re-added) | 0 (Git plugin gone) |
-| Threads at `checkAndUpdateRepositoryCollection` | 70 | 72 | **0** |
-| `git4idea.repo.*` thread refs | dozens | dozens | **0** |
-| `Coroutines in Cancelling state` | 2-4 (stuck) | 2 | **0** |
-| Perfwatcher "Thread pool exhaustion" rate | every ~5 s, indefinitely | every ~5 s | **none in 100 s** |
-| `UnindexedFilesIndexer - Finished` for rotek-apps | never reached | 49 s | **5.07 s** |
-| UI thread state | parked in modal pump | parked in modal pump | normal `EventQueue.getNextEvent` |
-| Process RSS | ~5.0 GiB | 5.1 GiB | **1.9 GiB** |
-| CPU pattern (8 s sample) | 0 forward progress | 0 forward progress | 35 s indexer burst, then idle <1 s |
-| Outcome | hard kill required | hard kill required | **clean, usable** |
+| Metric | Original (167 mappings) | Trim-only attempt | Git4Idea disabled (§5.2) | `-javaagent` installed (§5.3) |
+|---|---|---|---|---|
+| Mappings in `vcs.xml` | 167 | 170+ (auto-re-added) | 0 (plugin gone) | 167 (unchanged) |
+| Git UI inside PyCharm | yes (broken) | yes (broken) | **no** | **yes, working** |
+| Threads at `checkAndUpdateRepositoryCollection` | 70 | 72 | 0 | **0** |
+| `git4idea.repo.*` thread refs | dozens | dozens | 0 | a few (in-flight, non-blocking) |
+| `GitRepositoryImpl.<init>` in-flight | several | several | n/a | **0** |
+| Coroutines in `Cancelling` state | 2-4 (stuck) | 2 | 0 | **0** |
+| Perfwatcher "Thread pool exhaustion" | every ~5 s, indefinitely | every ~5 s | none in 100 s | **none in first 80 s** |
+| `UnindexedFilesIndexer - Finished` for rotek-apps | never reached | 49 s | 5.07 s | **4.6 s** |
+| `exit dumb mode [rotek-apps]` | never | never observed clean | clean | **3.0 s after launch** |
+| UI thread state | parked in modal pump | parked in modal pump | normal | normal `EventQueue.getNextEvent` |
+| Process RSS | ~5.0 GiB | 5.1 GiB | 1.9 GiB | ~2.0 GiB |
+| Outcome | hard kill required | hard kill required | clean, no Git UI | **clean, full Git UI** |
 
-The Git-disabled column was captured live on 2026-05-22 12:42 against
+The agent column was captured live against PyCharm Community 2026.1
+(build PY-261.23567.174) opening `rotek-apps` with all 167 mappings
+intact and the `-javaagent` line wired into `pycharm64.vmoptions`. The
+Git-disabled column was captured live on 2026-05-22 12:42 against
 PyCharm PID 109331, dump at `/tmp/pycharm-nogit-124413.txt`.
+
+The agent achieves the same indexer / freeze-watcher / RSS numbers as
+the plugin-disabled approach **while preserving every Git feature
+inside PyCharm**, because the in-lock `runBlocking` is what was
+pathological, not VCS auto-discovery itself.
 
 ---
 
 ## 7. Operational guidance for similar projects
 
-- **Cap the per-project VCS-mapping count below ≈10.** Above ≈30 the
-  IDE becomes visibly sluggish; above ≈100 the pathology in §3
-  manifests on every refresh.
-- For umbrella projects that group many independent repositories,
-  prefer one of these patterns:
-  - Single Git mapping on the umbrella, `<mapping ... vcs="" />` on the
-    parents of every nested-repo subtree (the §5.1 pattern).
-  - One PyCharm project per active repository, switched via
-    *File → Open Recent*.
-  - One project with multiple Content Roots (Settings → Project
-    Structure) but `vcs=""` on everything except the active root.
-- **Do not click "Add roots" on the "Unregistered VCS roots detected"
-  notification.** It will silently re-bloat `vcs.xml`. Click
-  "Configure" and add only what you actually need, or "Ignore" all.
-  Or just leave the auto-detector disabled (§5.2).
-- If the project lives on a FUSE/bindfs mount, see
-  `mount_options.md` — losing inotify makes every PyCharm restart do a
-  full rescan, which interacts badly with VCS re-detection.
+With the §5.3 agent loaded the N=167 multiplier is no longer
+pathological — constructors return in microseconds, `MODIFY_LOCK` is
+held only as long as it takes to enumerate roots, and `findNewRoots`
+completes essentially instantly even for very large umbrella projects.
+Most of the advice below is therefore now optional; it is retained as
+hygiene that still applies if the agent is unloaded, replaced, or no
+longer matches a future IntelliJ version.
+
+- For projects that group many independent repositories, **the agent
+  removes the need to trim `vcs.xml`** — 167 mappings work fine.
+  Trimming used to be a hard requirement; with the agent installed,
+  keep whatever mappings you actually want to commit through PyCharm.
+- If the agent is *not* installed (e.g. a managed IDE that locks
+  `pycharm64.vmoptions`), the older advice applies: cap the per-project
+  VCS-mapping count below ≈10; above ≈100 the §3 pathology manifests on
+  every refresh.
+- The auto-detector still runs even with the agent. Clicking "Add
+  roots" on the "Unregistered VCS roots detected" notification still
+  appends every nested `.git` to `vcs.xml`. This is no longer harmful
+  to performance with the agent, but it can still clutter the mapping
+  list — use "Configure" to add only the roots you actually use.
+- If the project lives on a FUSE/bindfs mount, losing inotify makes
+  every PyCharm restart do a full rescan, which is slow even with the
+  agent. Mount with `actimeo` tuning or use a native filesystem for
+  the project root.
+- Verify the agent is active on every PyCharm launch by checking for
+  the two `[VcsPatchAgent]` lines in `idea.log` (see §5.3). After a
+  JetBrains IDE update, also run `javap -c -p` on the patched
+  `GitRepositoryImpl` class image to confirm `<init>` no longer
+  contains a `runBlockingMaybeCancellable` reference. If the second
+  marker is missing or the WARNING `patch had no effect` is logged,
+  JetBrains has changed the target — the agent becomes a safe no-op
+  and PyCharm runs stock, at which point the §5.2 fallback (or
+  rebuilding the agent against the new target) becomes relevant.
 
 ---
 
@@ -467,30 +563,43 @@ not include.
 
 ## Appendix B — Files modified by this fix
 
-The working fix:
+The active fix (§5.3 agent):
+
+```
+/home/srvadmin/.config/JetBrains/PyCharm2026.1/agents/pycharm-vcs-patch.jar
+  (compiled from src/VcsPatchAgent.java; ASM 9 bundled)
+
+/home/srvadmin/.config/JetBrains/PyCharm2026.1/pycharm64.vmoptions
+  appended: -javaagent:/home/srvadmin/.config/JetBrains/PyCharm2026.1/agents/pycharm-vcs-patch.jar
+```
+
+No `.idea/vcs.xml` file needs to be modified for the agent fix. The
+167 mappings in `rotek-apps/.idea/vcs.xml` can remain as-is.
+
+Files that remain from the §5.2 fallback path used earlier in the
+diagnostic — they are now optional and can be reverted at any time:
 
 ```
 /home/srvadmin/.config/JetBrains/PyCharm2026.1/disabled_plugins.txt
-  appended: Git4Idea
-  appended: Subversion
+  Git4Idea          ← remove this line if you want Git UI back with the agent
+  Subversion        ← remove this line if you want SVN support back
 
-/media/srv-main-softdev/rotek-apps/.idea/vcs.xml          (mappings removed)
-/media/srv-main-softdev/projects/.idea/vcs.xml             (mappings removed)
-/media/srv-main-softdev/rnprivat/.idea/vcs.xml             (mappings removed)
+/media/srv-main-softdev/rotek-apps/.idea/vcs.xml          (blanked during §5.2)
+/media/srv-main-softdev/projects/.idea/vcs.xml             (blanked during §5.2)
+/media/srv-main-softdev/rnprivat/.idea/vcs.xml             (blanked during §5.2)
 ```
 
 Snapshots of the various states (kept for forensics or rollback):
 
 ```
-/media/srv-main-softdev/rotek-apps/.idea/vcs.xml.bak                       (28-mapping trim from 2026-05-12)
-/media/srv-main-softdev/rotek-apps/.idea/vcs.xml.bloated-20260522-121124.bak  (167-mapping pre-disable state)
-/media/srv-main-softdev/rotek-apps/.idea/vcs.xml.before-disable-<timestamp>.bak  (170+ re-bloated state)
+/media/srv-main-softdev/rotek-apps/.idea/vcs.xml.bak                            (28-mapping trim from 2026-05-12)
+/media/srv-main-softdev/rotek-apps/.idea/vcs.xml.bloated-20260522-121124.bak    (167-mapping pre-disable state)
+/media/srv-main-softdev/rotek-apps/.idea/vcs.xml.before-disable-<timestamp>.bak (170+ re-bloated state)
 /media/srv-main-softdev/projects/.idea/vcs.xml.before-disable-<timestamp>.bak
 /media/srv-main-softdev/rnprivat/.idea/vcs.xml.before-disable-<timestamp>.bak
 ```
 
-The earlier failed attempts left these artefacts that are now obsolete
-but harmless:
+Obsolete-but-harmless artefacts from earlier failed attempts:
 
 ```
 /home/srvadmin/.config/JetBrains/PyCharm2026.1/early-access-registry.txt
@@ -499,8 +608,7 @@ but harmless:
   (neither key is read by 2026.1; entries can be deleted but cost nothing)
 ```
 
-Pre-existing unrelated fixes from earlier in the same diagnostic session
-that are still in place:
+Pre-existing unrelated fixes that are still in place:
 
 ```
 /home/srvadmin/.config/JetBrains/PyCharm2026.1/pycharm64.vmoptions
@@ -516,24 +624,34 @@ that are still in place:
   also contains: org.jetbrains.junie  (disables AI Assistant / Junie)
 ```
 
-## Appendix C — Re-enabling Git later, safely
+## Appendix C — Re-enabling Git UI after the §5.2 fallback
 
-If at some point Git UI inside PyCharm becomes desirable again:
+If you were using the §5.2 plugin-disable workaround and want to switch
+to the §5.3 agent (recovering Git UI inside PyCharm):
 
-1. Remove the lines `Git4Idea` and `Subversion` from
+1. Install the agent: place
+   `dist/pycharm-vcs-patch.jar` at
+   `~/.config/JetBrains/PyCharm2026.1/agents/pycharm-vcs-patch.jar`
+   and add a `-javaagent:...` line to `pycharm64.vmoptions` pointing
+   at it. The repo's `./install.sh` does both.
+2. Remove the lines `Git4Idea` and `Subversion` from
    `~/.config/JetBrains/PyCharm2026.1/disabled_plugins.txt`.
-2. Before restarting PyCharm, populate `.idea/vcs.xml` with only the
-   few mappings you actually need — typically just the project's own
-   root: `<mapping directory="$PROJECT_DIR$" vcs="Git" />`.
-3. Open the project. When the "Unregistered VCS roots detected"
-   notification appears (it will), **do not click "Add roots"**. Click
-   "Configure", review the list, and add only the roots you intend to
-   actively commit through PyCharm.
-4. If you forget step 3 and the file balloons again, the recovery is
-   to kill PyCharm, re-trim `vcs.xml`, and try again. Keep N below ≈10
-   permanently.
+3. Restore `.idea/vcs.xml` from one of the `.bak` snapshots listed in
+   Appendix B, or simply leave it blank and let PyCharm's
+   auto-detector repopulate on first open — with the agent loaded,
+   neither approach causes a hang.
+4. Start PyCharm. Confirm the two `[VcsPatchAgent]` lines appear in
+   `idea.log` and that Git UI elements (branch widget, Changes view,
+   gutter) work.
 
-If "I want gutter blame and Changes view but only for repo X" is the
-goal, the cleanest pattern is **one PyCharm project per active repo**,
-opened individually via *File → Open Recent*. Umbrella projects above
-~10 nested repos remain a footgun in 2026.1.
+If you instead want to roll back the agent (return to the §5.2 plugin-
+disabled state):
+
+1. Remove the `-javaagent:...` line from `pycharm64.vmoptions`.
+2. Re-add `Git4Idea` (and optionally `Subversion`) to
+   `disabled_plugins.txt`.
+3. Blank `.idea/vcs.xml` per §5.2.
+
+To roll back to fully stock PyCharm (no agent, Git plugin enabled),
+just remove the `-javaagent:...` line and restart. The on-disk JAR can
+stay; it is inert without the vmoptions reference.
