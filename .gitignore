@@ -13,3 +13,6 @@
 
 # Don't ignore the published agent JAR
 !dist/pycharm-vcs-patch.jar
+
+# Local, per-developer settings (Claude Code etc.) - never commit
+*.local.json
