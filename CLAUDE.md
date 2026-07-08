@@ -1,4 +1,4 @@
-# CLAUDE.md — pycharm-vcs-deadlock-fix
+# CLAUDE.md - pycharm-vcs-deadlock-fix
 
 Context for AI assistants (Claude Code and similar) entering this
 repository.
@@ -6,9 +6,9 @@ repository.
 ## What this repository is
 
 A self-contained Java agent that patches one specific `INVOKESTATIC`
-inside `git4idea.repo.GitRepositoryImpl.<init>` — the call to
+inside `git4idea.repo.GitRepositoryImpl.<init>` - the call to
 `com.intellij.openapi.progress.CoroutinesKt.runBlockingMaybeCancellable`
-that wraps `workingTreeHolder.updateState()` — by replacing it with
+that wraps `workingTreeHolder.updateState()` - by replacing it with
 `POP; ACONST_NULL;`. This defuses the deadlock that occurs when
 `VcsRepositoryManager.checkAndUpdateRepositoryCollection` calls the
 constructor N times under the global `MODIFY_LOCK` for a project with
@@ -16,11 +16,11 @@ N nested git repositories.
 
 It is **not** a JetBrains-supported plugin; it is a userland
 workaround that operates by bytecode rewriting at JVM class-load
-time. The patch is permanent for the JVM session — there is no
+time. The patch is permanent for the JVM session - there is no
 restore logic, because the patched constructor is correct on its own.
 The `updateState()` it skipped runs lazily later via the same suspend
 function from `GitRepository.update()`, the existing alarm path, or
-any other refresh trigger — all outside the global VCS lock.
+any other refresh trigger - all outside the global VCS lock.
 
 Earlier iterations of this agent (preserved in git history) targeted
 `VcsRepositoryManager.findNewRoots` and used batched rate-limiting +
@@ -30,6 +30,21 @@ during each batch is still significant. The constructor patch removes
 the cost entirely.
 
 See [`README.md`](README.md) for the user-facing guide.
+
+> **Status (2026-07-08): fixed upstream in PyCharm 2026.1.3
+> (`PY-261.25134.203`).** JetBrains fixed the deadlock in
+> `git4idea.repo.GitWorkingTreeHolderImpl` (commit `3acd4218`): `updateState()`
+> is now `@RequiresBackgroundThread` and no longer switches to `Dispatchers.IO`
+> internally, so the constructor's `runBlockingMaybeCancellable` no longer
+> exhausts the coroutine thread pool under `MODIFY_LOCK`. Important for future
+> diagnosis: the target call still EXISTS in `GitRepositoryImpl.<init>` on fixed
+> builds, so do NOT conclude "still broken" from its presence - check whether
+> `GitWorkingTreeHolderImpl.updateState()` still has an internal
+> `Dispatchers.IO`/`withContext` switch (present = unfixed, agent still useful;
+> absent = fixed, agent redundant). PR JetBrains/intellij-community#3518 was
+> declined 2026-05-26 as already fixed; YouTrack IJPL-244177 resolved. The agent
+> has been disabled and uninstalled on lxc-pydev (repo kept). It stays relevant
+> only for older builds that still hop dispatchers inside `updateState()`.
 
 ## Architectural orientation
 
@@ -67,7 +82,7 @@ In PyCharm stdout, or in
 
 The first marker is logged unconditionally at premain. The second is
 logged only when the JVM first goes to load
-`git4idea.repo.GitRepositoryImpl` — typically within seconds of
+`git4idea.repo.GitRepositoryImpl` - typically within seconds of
 project open.
 
 If the agent logs a WARNING saying *"no runBlockingMaybeCancellable
@@ -124,7 +139,7 @@ to help. Other things that surface as "PyCharm hangs on indexing":
 
 - Slow filesystem (CIFS / NFS / FUSE bindfs without `actimeo` tuning).
   Symptom: high disk I/O during indexing, indexing eventually
-  completes (just slowly). This patch does nothing about that — fix
+  completes (just slowly). This patch does nothing about that - fix
   the storage. The diagnostic doc has a paragraph on this.
 - `data.services.jetbrains.com` slow / unreachable. Symptom:
   `RegionUrlMapper - Failed to fetch regional URL mappings`. Fix
@@ -143,18 +158,18 @@ thread dump will show clearly.
 - The transformer targets the **first** INVOKESTATIC of
   `runBlockingMaybeCancellable` inside `<init>`. If JetBrains adds
   another such call to the constructor before the existing one, we
-  would neutralize that one — likely incorrect. After a JetBrains
+  would neutralize that one - likely incorrect. After a JetBrains
   update, verify with `javap -c -p` on the patched class: `<init>`
   should contain zero `runBlockingMaybeCancellable` references (other
   methods of `GitRepositoryImpl` are fine).
 - The other call site (in `update()` / `GitRepositoryImpl$update$1`)
   is intentionally **not** patched. That path is called from outside
-  any global lock and the synchronous behaviour is desired —
+  any global lock and the synchronous behaviour is desired -
   user-initiated refresh should block until state is fresh.
 - The agent intercepts only by exact `(opcode, owner, name)` match. A
   rename of the helper or a move to a different class causes the
   agent to find zero call sites and log a WARNING. The agent then
-  becomes a no-op and PyCharm runs stock — failure mode is safe.
+  becomes a no-op and PyCharm runs stock - failure mode is safe.
 
 ## Code-style hints if extending
 

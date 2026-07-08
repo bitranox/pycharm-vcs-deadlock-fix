@@ -1,4 +1,4 @@
-# PyCharm "Analyzing project" hang — VCS root explosion deadlock
+# PyCharm "Analyzing project" hang - VCS root explosion deadlock
 
 Diagnosed live on 2026-05-22 against PyCharm Community 2026.1 (build
 PY-261.23567.174) running inside the PyCharm/desktop LXC (CT 1017) on
@@ -6,6 +6,20 @@ PY-261.23567.174) running inside the PyCharm/desktop LXC (CT 1017) on
 code-level root cause traced into the IntelliJ Community source, the
 applied configuration fix, and the upstream change that would
 permanently eliminate the pathology.
+
+> **Update (2026-07-08): fixed upstream in PyCharm 2026.1.3
+> (`PY-261.25134.203`).** The "upstream change that would permanently eliminate
+> the pathology" (see the recommendation below) has landed. JetBrains fixed it
+> not in the constructor but in `GitWorkingTreeHolderImpl` (commit `3acd4218`):
+> `updateState()` gained `@RequiresBackgroundThread` and lost its inner
+> `withContext(Dispatchers.IO)`, moving the dispatcher switch up into the
+> holder's launch/reload path. This kills the thread-pool exhaustion described
+> in section 4 while leaving the `runBlockingMaybeCancellable` call in
+> `GitRepositoryImpl.<init>` in place. Confirmed by disassembling the installed
+> 2026.1.3 `vcs-git.jar` bytecode. Upstream PR
+> JetBrains/intellij-community#3518 was declined 2026-05-26 as "already fixed";
+> YouTrack IJPL-244177 is resolved. The historical diagnosis below is unchanged
+> and remains valid for builds prior to the fix.
 
 ---
 
@@ -24,7 +38,7 @@ The other two umbrella projects (`projects` at
 `/media/srv-main-softdev/projects`, 114 mappings; `rnprivat`, 12
 mappings) showed the same class of hang at different intensities.
 
-The host filesystem (bindfs → ZFS), the network (JetBrains data-services
+The host filesystem (bindfs -> ZFS), the network (JetBrains data-services
 endpoint), and the JetBrains AI plugin were ruled out as causes through
 earlier diagnostic passes. The remaining culprit was the project's VCS
 configuration: `rotek-apps/.idea/vcs.xml` had grown to **167 nested git
@@ -53,7 +67,7 @@ and were used to corroborate the live `jcmd` dumps.
 
 The frozen-process CPU was measured via `/proc/PID/stat` (utime+stime in
 clock ticks, multiplied by `1000 / getconf CLK_TCK`). `/proc/PID/schedstat`
-**should not be used inside LXC on this host** — it returns near-zero
+**should not be used inside LXC on this host** - it returns near-zero
 values regardless of actual CPU consumption (caveat in §8).
 
 ---
@@ -69,7 +83,7 @@ garbage-first heap   total reserved 12288000K, committed 4562944K, used 2749576K
 ```
 
 Heap is set to `-Xmx12000m`. Of 12 GiB max, **4.5 GiB committed, 2.7 GiB
-used**. Adding more heap has zero effect on this class of hang — the JVM
+used**. Adding more heap has zero effect on this class of hang - the JVM
 isn't paging, isn't in a long GC, and the JNI thread count is normal.
 
 ### 3.2 Thread state summary
@@ -133,7 +147,7 @@ constructor at line 81 does:
 runBlockingMaybeCancellable { workingTreeHolder.updateState() }
 ```
 
-— a synchronous blocking call from within the write critical section,
+- a synchronous blocking call from within the write critical section,
 which parks on a child coroutine. That child:
 
 ```
@@ -168,14 +182,14 @@ it.
 does a `runBlocking` on `GitWorkingTreeHolderImpl.updateState`, which
 serially: takes `updateLock`, publishes events, and runs a `git`
 subprocess (`git worktree list --porcelain`). For one new root that's
-maybe 50–200 ms. For 167 it is *seconds-to-minutes* of held lock per
+maybe 50-200 ms. For 167 it is *seconds-to-minutes* of held lock per
 sweep. Every time the Alarm at `VcsRepositoryManager.kt:165` reschedules
 itself (every project event, file change, or focus change), this whole
 walk repeats.
 
 The 70-deep waiter queue we observed is the steady-state result of
 "the lock holder runs ~tens of seconds per refresh; refresh requests
-arrive faster than they drain." That is the deadlock you saw — not a
+arrive faster than they drain." That is the deadlock you saw - not a
 classic two-lock cycle, but a pathological serialization with N=167
 multiplier and a `runBlocking` inside the critical section.
 
@@ -188,7 +202,7 @@ Source (IntelliJ Community, `master` branch, current at time of writing):
 - `platform/dvcs-impl/src/com/intellij/dvcs/repo/VcsRepositoryManager.kt`
   - `ensureUpToDate` (line 165): scheduled by `Alarm` on most VCS events.
   - `checkAndUpdateRepositoryCollection` (line 354): takes `MODIFY_LOCK.lock()`.
-  - Lambda at lines 368–373: while `MODIFY_LOCK` is held, runs
+  - Lambda at lines 368-373: while `MODIFY_LOCK` is held, runs
     `findInvalidRoots` and `findNewRoots`.
   - `findNewRoots` (line 408): iterates candidate roots, calls
     `Companion.tryCreateRepository`.
@@ -197,7 +211,7 @@ Source (IntelliJ Community, `master` branch, current at time of writing):
   - Constructor (line 81): `runBlockingMaybeCancellable { workingTreeHolder.updateState() }`
   - `Companion.createInstance` (line 268): instantiates plus installs listeners.
 - `plugins/git4idea/src/git4idea/repo/GitWorkingTreeHolderImpl.kt`
-  - `updateState` (line 37–60): `@RequiresBackgroundThread`, takes
+  - `updateState` (line 37-60): `@RequiresBackgroundThread`, takes
     `updateLock` Mutex (line 38), updates a `MutableStateFlow`,
     synchronously publishes to the project message bus,
     `Git.listWorktrees(repository)` subprocess.
@@ -216,7 +230,7 @@ Source (IntelliJ Community, `master` branch, current at time of writing):
    child coroutine can include `git` subprocess execution, message-bus
    sync-publish (re-entrant into project services), and IDE
    `RWMutexIdeaImpl` acquisition. Any of these can suspend for a long
-   time — and during that time the global VCS lock is held.
+   time - and during that time the global VCS lock is held.
 3. **The Alarm-driven `ensureUpToDate` has no rate-limiting.** It is
    rescheduled on most VCS-relevant events. With N=167 it fires
    continuously, leaving the lock held effectively all the time.
@@ -251,14 +265,14 @@ We cannot patch the IntelliJ source tree, but we can patch the running
 JVM. Three approaches were considered:
 
 - **(a)** Reduce N (the number of nested VCS mappings) to a single-digit
-  number by trimming `.idea/vcs.xml`. *Tried, did not work — see §5.1.*
+  number by trimming `.idea/vcs.xml`. *Tried, did not work - see §5.1.*
 - **(b)** Eliminate the VCS subsystem entirely by disabling the Git4Idea
   plugin. *Works, but you lose the gutter / Changes view / branch UI
-  inside PyCharm — see §5.2.*
+  inside PyCharm - see §5.2.*
 - **(c)** Patch the constructor at JVM class-load time, via a
   `-javaagent` JAR that rewrites the one `INVOKESTATIC` that triggers
   the in-lock `runBlocking`. *This is the actual fix that is now in
-  place — see §5.3.*
+  place - see §5.3.*
 
 §5.1 is preserved because the failure mode is non-obvious and worth
 documenting. §5.2 is preserved because it remains a valid fallback for
@@ -287,7 +301,7 @@ vcs.root.detector.enabled       false
 git.repository.root.detector.enabled  false
 ```
 
-appended to `early-access-registry.txt` had no effect in 2026.1 — those
+appended to `early-access-registry.txt` had no effect in 2026.1 - those
 key names are not what the platform's `VcsRootProblemNotifier` /
 `VcsRootScanner` actually read. Unknown keys are silently ignored, so
 the entries are harmless, but they did not suppress anything.
@@ -296,14 +310,14 @@ the entries are harmless, but they did not suppress anything.
 
 This is the **previous** workaround used during diagnosis, retained
 here as a documented fallback. It is no longer the active fix on this
-machine — the agent in §5.3 is — but it remains useful when running a
+machine - the agent in §5.3 is - but it remains useful when running a
 `-javaagent` is not an option (e.g. corporate-managed IDEs that lock
 `pycharm64.vmoptions`, or environments where the user simply does not
 need Git UI inside PyCharm).
 
 The idea is to remove the VCS subsystem from PyCharm entirely. With
 Git4Idea disabled there is no `VcsRepositoryManager`, no `MODIFY_LOCK`,
-no `findNewRoots`, no `runBlocking` in `GitRepositoryImpl.<init>` — the
+no `findNewRoots`, no `runBlocking` in `GitRepositoryImpl.<init>` - the
 entire code path documented in §3 and §4 simply does not exist in the
 process. All `git` work must then be done from the terminal.
 
@@ -314,7 +328,7 @@ Git4Idea
 Subversion
 ```
 
-`Subversion` is included for symmetry — none of these trees use SVN,
+`Subversion` is included for symmetry - none of these trees use SVN,
 but the same plugin would scan if SVN repos appeared.
 
 With the Git plugin disabled, `.idea/vcs.xml` mappings have no effect,
@@ -366,7 +380,7 @@ exactly one bytecode instruction inside one method of one class:
 The state that `updateState()` would have populated synchronously
 (current branch, HEAD, staging info) is left in its default empty
 state. The state-flow is populated lazily a few hundred milliseconds
-later, the first time any caller of `GitRepository.update()` runs —
+later, the first time any caller of `GitRepository.update()` runs -
 typically the same alarm that triggered the construction, just *after*
 `MODIFY_LOCK` has been released. UI elements that subscribe to the
 state-flow (gutter, branch widget, Changes view, log) update reactively
@@ -414,7 +428,7 @@ useful regardless of which fix above is active:
 
 These address an unrelated 11-s `RegionUrlMapper` fetch
 (`data.services.jetbrains.com/products` returns 26 MB) and silence the
-freeze-dump spam, but do *not* fix the VCS deadlock — only §5.3 (or as
+freeze-dump spam, but do *not* fix the VCS deadlock - only §5.3 (or as
 a fallback, §5.2) does.
 
 ### 5.5 Junie / AI Assistant disabled
@@ -462,7 +476,7 @@ pathological, not VCS auto-discovery itself.
 ## 7. Operational guidance for similar projects
 
 With the §5.3 agent loaded the N=167 multiplier is no longer
-pathological — constructors return in microseconds, `MODIFY_LOCK` is
+pathological - constructors return in microseconds, `MODIFY_LOCK` is
 held only as long as it takes to enumerate roots, and `findNewRoots`
 completes essentially instantly even for very large umbrella projects.
 Most of the advice below is therefore now optional; it is retained as
@@ -470,7 +484,7 @@ hygiene that still applies if the agent is unloaded, replaced, or no
 longer matches a future IntelliJ version.
 
 - For projects that group many independent repositories, **the agent
-  removes the need to trim `vcs.xml`** — 167 mappings work fine.
+  removes the need to trim `vcs.xml`** - 167 mappings work fine.
   Trimming used to be a hard requirement; with the agent installed,
   keep whatever mappings you actually want to commit through PyCharm.
 - If the agent is *not* installed (e.g. a managed IDE that locks
@@ -481,7 +495,7 @@ longer matches a future IntelliJ version.
   roots" on the "Unregistered VCS roots detected" notification still
   appends every nested `.git` to `vcs.xml`. This is no longer harmful
   to performance with the agent, but it can still clutter the mapping
-  list — use "Configure" to add only the roots you actually use.
+  list - use "Configure" to add only the roots you actually use.
 - If the project lives on a FUSE/bindfs mount, losing inotify makes
   every PyCharm restart do a full rescan, which is slow even with the
   agent. Mount with `actimeo` tuning or use a native filesystem for
@@ -492,7 +506,7 @@ longer matches a future IntelliJ version.
   `GitRepositoryImpl` class image to confirm `<init>` no longer
   contains a `runBlockingMaybeCancellable` reference. If the second
   marker is missing or the WARNING `patch had no effect` is logged,
-  JetBrains has changed the target — the agent becomes a safe no-op
+  JetBrains has changed the target - the agent becomes a safe no-op
   and PyCharm runs stock, at which point the §5.2 fallback (or
   rebuilding the agent against the new target) becomes relevant.
 
@@ -512,15 +526,15 @@ $ awk '{print $14+$15+$16+$17}' /proc/87509/stat   # via utime+stime in ticks
 ```
 
 `/proc/PID/schedstat` requires `CONFIG_SCHEDSTATS=y` in the kernel and
-correct accounting per task — both are inconsistent in unprivileged or
+correct accounting per task - both are inconsistent in unprivileged or
 lxcfs-virtualised containers. **Use `/proc/PID/stat` field 14+15
 (`utime + stime` in clock ticks, divide by `getconf CLK_TCK`) instead**
 for accurate CPU sampling inside the container. Or use `top`/`htop`,
 which read from `/proc/PID/stat` internally.
 
-This does not change the substance of any earlier diagnostic — the
+This does not change the substance of any earlier diagnostic - the
 hangs were real and corroborated by the perfwatcher logs, the live
-thread-dump waiter queues, and the user-visible UI freeze — but the
+thread-dump waiter queues, and the user-visible UI freeze - but the
 *specific framing* "0 ms CPU = deadlocked" was over-confident. The
 correct framing is "70 threads parked on the same write lock, lock
 holder parked on a `runBlocking`-of-a-suspended-child, no forward
@@ -528,7 +542,7 @@ progress on the user-visible task."
 
 ---
 
-## Appendix A — Reproducing the diagnostic
+## Appendix A - Reproducing the diagnostic
 
 To repeat any of this against a live PyCharm process:
 
@@ -561,7 +575,7 @@ not include.
 
 ---
 
-## Appendix B — Files modified by this fix
+## Appendix B - Files modified by this fix
 
 The active fix (§5.3 agent):
 
@@ -577,7 +591,7 @@ No `.idea/vcs.xml` file needs to be modified for the agent fix. The
 167 mappings in `rotek-apps/.idea/vcs.xml` can remain as-is.
 
 Files that remain from the §5.2 fallback path used earlier in the
-diagnostic — they are now optional and can be reverted at any time:
+diagnostic - they are now optional and can be reverted at any time:
 
 ```
 /home/srvadmin/.config/JetBrains/PyCharm2026.1/disabled_plugins.txt
@@ -624,7 +638,7 @@ Pre-existing unrelated fixes that are still in place:
   also contains: org.jetbrains.junie  (disables AI Assistant / Junie)
 ```
 
-## Appendix C — Re-enabling Git UI after the §5.2 fallback
+## Appendix C - Re-enabling Git UI after the §5.2 fallback
 
 If you were using the §5.2 plugin-disable workaround and want to switch
 to the §5.3 agent (recovering Git UI inside PyCharm):
@@ -638,7 +652,7 @@ to the §5.3 agent (recovering Git UI inside PyCharm):
    `~/.config/JetBrains/PyCharm2026.1/disabled_plugins.txt`.
 3. Restore `.idea/vcs.xml` from one of the `.bak` snapshots listed in
    Appendix B, or simply leave it blank and let PyCharm's
-   auto-detector repopulate on first open — with the agent loaded,
+   auto-detector repopulate on first open - with the agent loaded,
    neither approach causes a hang.
 4. Start PyCharm. Confirm the two `[VcsPatchAgent]` lines appear in
    `idea.log` and that Git UI elements (branch widget, Changes view,
