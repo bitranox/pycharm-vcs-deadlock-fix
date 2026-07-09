@@ -16,3 +16,5 @@
 
 # Local, per-developer settings (Claude Code etc.) - never commit
 *.local.json
+# bitranox curated memory (local; CLAUDE.local.md @imports it)
+CLAUDE.local.md
